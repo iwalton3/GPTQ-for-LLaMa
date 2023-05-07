@@ -136,7 +136,7 @@ except:
 
 # Assumes layer is perfectly divisible into 256 * 256 blocks
 class QuantLinear(nn.Module):
-    def __init__(self, bits, groupsize, infeatures, outfeatures, bias, faster=False, kernel_switch_threshold=128):
+    def __init__(self, bits, groupsize, infeatures, outfeatures, bias, faster=False, kernel_switch_threshold=64):
         super().__init__()
         if bits not in [2,3,4,8]:
             raise NotImplementedError("Only 2,3,4,8 bits are supported.")
