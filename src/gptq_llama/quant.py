@@ -284,6 +284,8 @@ class QuantLinear(nn.Module):
         # from https://github.com/qwopqwop200/GPTQ-for-LLaMa/blob/cuda/quant.py
         # main kernel is very slow for big initial inputs
         if not self.kernel_switch_threshold is None and x.shape[0] > self.kernel_switch_threshold:
+            if self.scales.dtype != torch.float16:
+                self.scales = self.scales.half()
             if self.bits in [2,4,8]:
                 zeros = torch.bitwise_right_shift(torch.unsqueeze(self.qzeros, 2).expand(-1, -1, 32 // self.bits), self.wf.unsqueeze(0)).to(torch.int16 if self.bits == 8 else torch.int8)
                 torch.bitwise_and(zeros, (2 ** self.bits) - 1, out=zeros)
@@ -349,9 +351,11 @@ class QuantLinear(nn.Module):
             elif self.bits == 4:
                 quant_cuda.vecquant4matmul_faster(x, self.qweight, y, self.scales, self.qzeros, self.g_idx, self.half_indim)
             else:
-                raise NotImplementedError("Only 3 bits are supported.")
+                raise NotImplementedError("Only 3 and 4 bits are supported.")
         else:
             x = x.float()
+            if self.scales.dtype != torch.float32:
+                self.scales = self.scales.float()
             if self.bits == 2:
                 quant_cuda.vecquant2matmul(x, self.qweight, y, self.scales, self.qzeros, self.groupsize)
             elif self.bits == 3:
@@ -366,6 +370,8 @@ class QuantLinear(nn.Module):
         return y.reshape(outshape)
 
 def make_quant(module, names, bits, groupsize, faster=True, name=''):
+    if not faster and bits in [3,4]:
+        faster=True
     if isinstance(module, QuantLinear):
         return
     for attr in dir(module):
