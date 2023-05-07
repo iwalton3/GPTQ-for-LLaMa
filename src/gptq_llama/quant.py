@@ -153,21 +153,25 @@ class QuantLinear(nn.Module):
         self.register_buffer(
             'qweight', torch.zeros((infeatures // 32 * bits, outfeatures), dtype=torch.int)
         )
+        self.register_buffer(
+            'g_idx', torch.tensor([i // self.groupsize for i in range(infeatures)], dtype=torch.int)
+        )
         self.half_indim = self.infeatures // 2
         self._initialized_quant_state = False
         self.faster = faster
 
-    def pack(self, linear, scales, zeros):
+    def pack(self, linear, scales, zeros, g_idx=None):
+        self.g_idx = (g_idx.clone() if g_idx is not None else self.g_idx).to(torch.int)
+
         scales = scales.t().contiguous()
         zeros = zeros.t().contiguous()
         scale_zeros = zeros * scales
         self.scales = scales.clone()
         if linear.bias is not None:
-            self.bias = linear.bias.clone() 
-            
+            self.bias = linear.bias.clone()
+
         intweight = []
         for idx in range(self.infeatures):
-            g_idx = idx // self.groupsize
             intweight.append(torch.round((linear.weight.data[:,idx] + scale_zeros[g_idx]) / self.scales[g_idx]).to(torch.int)[:,None])
         intweight = torch.cat(intweight,dim=1)
         intweight = intweight.t().contiguous()
@@ -204,10 +208,10 @@ class QuantLinear(nn.Module):
                 row += 1
             else:
                 raise NotImplementedError("Only 2,3,4,8 bits are supported.")
-                
+
         qweight = qweight.astype(np.int32)
-        self.qweight = torch.from_numpy(qweight) 
-        
+        self.qweight = torch.from_numpy(qweight)
+
         zeros -= 1;
         zeros = zeros.numpy().astype(np.uint32)
         qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // 256 * (self.bits * 8)), dtype=np.uint32)
@@ -240,9 +244,9 @@ class QuantLinear(nn.Module):
                 col += 1
             else:
                 raise NotImplementedError("Only 2,3,4,8 bits are supported.")
-                
+
         qzeros = qzeros.astype(np.int32)
-        self.qzeros = torch.from_numpy(qzeros) 
+        self.qzeros = torch.from_numpy(qzeros)
 
     def forward(self, x):
         if not self._initialized_quant_state:
@@ -257,15 +261,19 @@ class QuantLinear(nn.Module):
         outshape[-1] = self.outfeatures
         x = x.reshape(-1, x.shape[-1])
         if self.bias is None:
-            y = torch.zeros(x.shape[0], outshape[-1], dtype=torch.float32, device=x.device)
+            y = torch.zeros(x.shape[0], outshape[-1], dtype=torch.float16 if self.faster else torch.float32, device=x.device)
         else:
             y = self.bias.clone().repeat(x.shape[0], 1)
 
         output_dtype = x.dtype
         if self.faster:
             x = x.half()
+            if self.scales.dtype != torch.float16:
+                self.scales = self.scales.half()
             if self.bits == 3:
                 quant_cuda.vecquant3matmul_faster(x, self.qweight, y, self.scales, self.qzeros, self.groupsize, self.half_indim)
+            elif self.bits == 4:
+                quant_cuda.vecquant4matmul_faster(x, self.qweight, y, self.scales, self.qzeros, self.g_idx, self.half_indim)
             else:
                 raise NotImplementedError("Only 3 bits are supported.")
         else:
@@ -275,7 +283,7 @@ class QuantLinear(nn.Module):
             elif self.bits == 3:
                 quant_cuda.vecquant3matmul(x, self.qweight, y, self.scales, self.qzeros, self.groupsize)
             elif self.bits == 4:
-                quant_cuda.vecquant4matmul(x, self.qweight, y, self.scales, self.qzeros, self.groupsize)
+                quant_cuda.vecquant4matmul(x, self.qweight, y, self.scales, self.qzeros, self.g_idx)
             elif self.bits == 8:
                 quant_cuda.vecquant8matmul(x, self.qweight, y, self.scales, self.qzeros, self.groupsize)
             else:
@@ -283,7 +291,7 @@ class QuantLinear(nn.Module):
         y = y.to(output_dtype)
         return y.reshape(outshape)
 
-def make_quant(module, names, bits, groupsize, faster=False, name=''):
+def make_quant(module, names, bits, groupsize, faster=True, name=''):
     if isinstance(module, QuantLinear):
         return
     for attr in dir(module):

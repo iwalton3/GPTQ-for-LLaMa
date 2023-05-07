@@ -938,17 +938,36 @@ __global__ void VecQuant4MatMulKernelFaster(
   __syncthreads();
 
   while (k < blockwidth2) {
-    int g = as_int(g_idx[g_h + (k * 2)]);
-	  scalar_t scale_f = scales[g * width + w];
-    half2 scale = __half2half2(scale_f);
-    half2 zero = __half2half2(__hmul(-scale_f, __int2half_rn(((as_unsigned(zeros[g * zero_width + z_w]) >> z_mod) & 0xF) + 1)));
+    //int g = as_int(g_idx[g_h + (k * 2)]);
+	  //scalar_t scale_f = scales[g * width + w];
+    //half2 scale = __half2half2(scale_f);
+    //half2 zero = __half2half2(__hmul(-scale_f, __int2half_rn(((as_unsigned(zeros[g * zero_width + z_w]) >> z_mod) & 0xF) + 1)));
 
     res2 = {};
     tmp = as_unsigned(mat[i]);
-    res2 = __hfma2(__hfma2(deq2[(tmp >>  0) & 0xff][off], scale, zero), blockvec[k + 0], res2);
-    res2 = __hfma2(__hfma2(deq2[(tmp >>  8) & 0xff][off], scale, zero), blockvec[k + 1], res2);
-    res2 = __hfma2(__hfma2(deq2[(tmp >> 16) & 0xff][off], scale, zero), blockvec[k + 2], res2);
-    res2 = __hfma2(__hfma2(deq2[(tmp >> 24) & 0xff][off], scale, zero), blockvec[k + 3], res2);
+
+    int tmp_k = 0;
+    half2 scales_tmp[4];
+    half2 zeros_tmp[4];
+    while (tmp_k < 4) {
+      int g = as_int(g_idx[g_h + (k + tmp_k) * 2]);
+      int g2 = as_int(g_idx[g_h + (k + tmp_k) * 2 + 1]);
+      scalar_t scale_f = scales[g * width + w];
+      scalar_t scale_f2 = scales[g2 * width + w];
+      half2 scale = __halves2half2(scale_f, scale_f2);
+      half2 zero = __halves2half2(
+        __hmul(-scale_f, __int2half_rn(((as_unsigned(zeros[g * zero_width + z_w]) >> z_mod) & 0xF) + 1)),
+        __hmul(-scale_f2, __int2half_rn(((as_unsigned(zeros[g2 * zero_width + z_w]) >> z_mod) & 0xF) + 1))
+      );
+      scales_tmp[tmp_k] = scale;
+      zeros_tmp[tmp_k] = zero;
+      tmp_k += 1;
+    }
+
+    res2 = __hfma2(__hfma2(deq2[(tmp >>  0) & 0xff][off], scales_tmp[0], zeros_tmp[0]), blockvec[k + 0], res2);
+    res2 = __hfma2(__hfma2(deq2[(tmp >>  8) & 0xff][off], scales_tmp[1], zeros_tmp[1]), blockvec[k + 1], res2);
+    res2 = __hfma2(__hfma2(deq2[(tmp >> 16) & 0xff][off], scales_tmp[2], zeros_tmp[2]), blockvec[k + 2], res2);
+    res2 = __hfma2(__hfma2(deq2[(tmp >> 24) & 0xff][off], scales_tmp[3], zeros_tmp[3]), blockvec[k + 3], res2);
 	  i += width;
     k += 4;
     res = __hadd(res, __hadd(res2.x, res2.y));;
@@ -1197,7 +1216,7 @@ __global__ void VecQuant4MatMulSeqV2Kernel(
     zero_shifter[idx] = idx % 8 * 4;
   }
   __syncthreads();
-  
+
   scalar_t res = 0;
   unsigned int tmp;
   int k = 0;
@@ -1207,7 +1226,7 @@ __global__ void VecQuant4MatMulSeqV2Kernel(
 
   while (k < BLOCKWIDTH_SEQ_V2) {
     tmp = as_unsigned(mat_t[mat_i]);
-    
+
     scalar_t scales_tmp[8];
     scalar_t zeros_tmp[8];
     int g;
