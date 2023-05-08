@@ -46,6 +46,7 @@ def llama_sequential(model, dataloader, dev):
             inps[cache['i']] = inp
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -62,6 +63,7 @@ def llama_sequential(model, dataloader, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
 
     print('Ready.')
 
@@ -78,7 +80,7 @@ def llama_sequential(model, dataloader, dev):
             ]
         else:
             sequential = [list(full.keys())]
-       
+
         for names in sequential:
             subset = {n: full[n] for n in names}
             gptq = {}
@@ -88,7 +90,7 @@ def llama_sequential(model, dataloader, dev):
                 gptq[name].quantizer.configure(
                     args.wbits, perchannel=True, sym=args.sym, mse=False
                 )
-                
+
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
@@ -97,7 +99,7 @@ def llama_sequential(model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids = position_ids)[0]
             for h in handles:
                 h.remove()
 
@@ -107,19 +109,19 @@ def llama_sequential(model, dataloader, dev):
                 scale,zero = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
                 quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer,scale,zero)
                 gptq[name].free()
-                
+
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids = position_ids)[0]
 
         layers[i] = layer.cpu()
         del layer
-        del gptq 
+        del gptq
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    
+
     return quantizers
 
 @torch.no_grad()
@@ -150,6 +152,7 @@ def llama_eval(model, testenc, dev):
             inps[cache['i']] = inp
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
@@ -166,11 +169,12 @@ def llama_eval(model, testenc, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
 
     for i in range(len(layers)):
         print(i)
         layer = layers[i].to(dev)
-        
+
         if args.nearest:
             subset = find_layers(layer)
             for name in subset:
@@ -185,7 +189,7 @@ def llama_eval(model, testenc, dev):
                 ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids = position_ids)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
@@ -231,13 +235,13 @@ def llama_pack(model, quantizers, wbits, groupsize):
     return model
 
 def load_quant(model, checkpoint, wbits, groupsize):
-    from transformers import LlamaConfig, LlamaForCausalLM 
+    from transformers import LlamaConfig, LlamaForCausalLM
     config = LlamaConfig.from_pretrained(model)
     def noop(*args, **kwargs):
         pass
-    torch.nn.init.kaiming_uniform_ = noop 
-    torch.nn.init.uniform_ = noop 
-    torch.nn.init.normal_ = noop 
+    torch.nn.init.kaiming_uniform_ = noop
+    torch.nn.init.uniform_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
@@ -252,7 +256,7 @@ def load_quant(model, checkpoint, wbits, groupsize):
     make_quant(model, layers, wbits, groupsize, faster=args.faster_kernel)
 
     del layers
-    
+
     print('Loading model ...')
     if checkpoint.endswith('.safetensors'):
         from safetensors.torch import load_file as safe_load
@@ -376,7 +380,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--nearest', action='store_true',
         help='Whether to run the RTN baseline.'
-    ) 
+    )
     parser.add_argument(
         '--wbits', type=int, default=16, choices=[2, 3, 4, 8, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
@@ -433,7 +437,7 @@ if __name__ == '__main__':
 
     if type(args.load) is not str:
         args.load = args.load.as_posix()
-    
+
     if args.load:
         model = load_quant(args.model, args.load, args.wbits, args.groupsize)
     else:
@@ -461,10 +465,10 @@ if __name__ == '__main__':
     if args.load:
         exit()
 
-    datasets = ['wikitext2', 'ptb', 'c4'] 
+    datasets = ['wikitext2', 'ptb', 'c4']
     if args.new_eval:
       datasets = ['wikitext2', 'ptb-new', 'c4-new']
-    for dataset in datasets: 
+    for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
@@ -473,7 +477,7 @@ if __name__ == '__main__':
 
     if args.save:
         llama_pack(model, quantizers, args.wbits, args.groupsize)
-        torch.save(model.state_dict(), args.save) 
+        torch.save(model.state_dict(), args.save)
 
     if args.save_safetensors:
         llama_pack(model, quantizers, args.wbits, args.groupsize)

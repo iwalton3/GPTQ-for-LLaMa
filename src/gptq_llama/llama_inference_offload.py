@@ -10,7 +10,7 @@ from .quant import *
 from transformers import AutoTokenizer
 
 DEV = torch.device('cuda:0')
-import copy 
+import copy
 from transformers.models.llama.modeling_llama import LlamaModel,LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from typing import List, Optional, Tuple, Union
@@ -24,6 +24,7 @@ class Offload_LlamaModel(LlamaModel):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -44,6 +45,10 @@ class Offload_LlamaModel(LlamaModel):
                 - 1 for tokens that are **not masked**,
                 - 0 for tokens that are **masked**.
                 [What are attention masks?](../glossary#attention-mask)
+            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Indices of positions of each input sequence tokens in the position embeddings. Selected in the range
+                `[0, config.n_positions - 1]`.
+                [What are position IDs?](../glossary#position-ids)
             past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
                 Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
                 shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of
@@ -90,13 +95,26 @@ class Offload_LlamaModel(LlamaModel):
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
-            
+
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
         if attention_mask is None:
             torch.ones((batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device	)
+
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
+            )
 
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
@@ -115,13 +133,13 @@ class Offload_LlamaModel(LlamaModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-        
+
         for idx in range(len(self.layers)):
             if idx <= (self.preload - 1):
                 decoder_layer = self.layers[idx]
             else:
                 decoder_layer = self.layers[idx].to(DEV)
-                
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -140,24 +158,26 @@ class Offload_LlamaModel(LlamaModel):
                     create_custom_forward(decoder_layer),
                     hidden_states,
                     attention_mask,
+                    position_ids,
                     None,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
 
             hidden_states = layer_outputs[0]
-            
+
             if idx > (self.preload - 1):
                 self.layers[idx] = decoder_layer.cpu()
             del decoder_layer
             torch.cuda.empty_cache()
-                
+
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -183,13 +203,13 @@ class Offload_LlamaModel(LlamaModel):
 
 def load_quant(model, checkpoint, wbits, groupsize, pre_layer):
     transformers.models.llama.modeling_llama.LlamaModel = Offload_LlamaModel
-    from transformers import LlamaConfig, LlamaForCausalLM 
+    from transformers import LlamaConfig, LlamaForCausalLM
     config = LlamaConfig.from_pretrained(model)
     def noop(*args, **kwargs):
         pass
-    torch.nn.init.kaiming_uniform_ = noop 
-    torch.nn.init.uniform_ = noop 
-    torch.nn.init.normal_ = noop 
+    torch.nn.init.kaiming_uniform_ = noop
+    torch.nn.init.uniform_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
@@ -210,7 +230,7 @@ def load_quant(model, checkpoint, wbits, groupsize, pre_layer):
     else:
         model.load_state_dict(torch.load(checkpoint))
     model.seqlen = 2048
-    
+
     for i in range(pre_layer):
         model.model.layers[i].to(DEV)
     model.model.embed_tokens.to(DEV)
@@ -246,39 +266,39 @@ if __name__ == '__main__':
         '--text', type=str,
         help='input text'
     )
-    
+
     parser.add_argument(
         '--min_length', type=int, default=10,
         help='The minimum length of the sequence to be generated.'
     )
-    
+
     parser.add_argument(
         '--max_length', type=int, default=50,
         help='The maximum length of the sequence to be generated.'
     )
-    
+
     parser.add_argument(
         '--top_p', type=float , default=0.95,
         help='If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to top_p or higher are kept for generation.'
     )
-    
+
     parser.add_argument(
         '--temperature', type=float, default=0.8,
         help='The value used to module the next token probabilities.'
     )
-    
+
     parser.add_argument(
         '--pre_layer', type=int, default=50,
         help='The number of layers to preload'
     )
-    
+
     args = parser.parse_args()
 
     if type(args.load) is not str:
         args.load = args.load.as_posix()
-    
+
     model = load_quant(args.model, args.load, args.wbits, args.groupsize, args.pre_layer)
-        
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     input_ids = tokenizer.encode(args.text, return_tensors="pt").to(DEV)
 
