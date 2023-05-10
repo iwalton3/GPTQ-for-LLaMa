@@ -50,6 +50,22 @@ __device__ __forceinline__ void atomicAdd(c10::Half* address, c10::Half val) {
     // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
     } while (assumed != old);
 }
+__device__ __forceinline__ void atomicAdd(__half* address, c10::Half val) {
+    unsigned int * address_as_ui =
+      (unsigned int *) ((char *)address - ((size_t)address & 2));
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+
+  do {
+    assumed = old;
+    __half_raw hsum;
+    hsum.x = (size_t)address & 2 ? (old >> 16) : (old & 0xffff);
+    half tmpres = __hadd(hsum, val);
+    hsum = __half_raw(tmpres);
+    old = (size_t)address & 2 ? (old & 0xffff) | (hsum.x << 16) : (old & 0xffff0000) | hsum.x;
+    old = atomicCAS(address_as_ui, assumed, old);
+   } while (assumed != old);
+}
 #endif
 #endif
 
